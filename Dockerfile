@@ -1,7 +1,7 @@
-# Use a base image with gcc and cmake, Ubuntu in this case
+# Usar una imagen base de Ubuntu 
 FROM ubuntu:latest
 
-# Install necessary packages
+# Instalar las dependencias necesarias para compilar los archivos fuente
 RUN apt-get update && apt-get install -y \
     build-essential \
     cmake \
@@ -9,16 +9,31 @@ RUN apt-get update && apt-get install -y \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Set the working directory inside the container
+# Crear un directorio de trabajo
 WORKDIR /usr/src/app
 
-# Copy everything in the current directory to the working directory in the container
-COPY . .
+# Copiar los archivos fuente de las librerías compartidas de Kyber y Dilithium
+COPY ./kyber ./kyber 
+COPY ./dilithium ./dilithium
+COPY ./Makefile ./Makefile
 
-# Compile the project using make and create symbolic links in /usr/lib
-RUN make && \
+# Compilar las librerías compartidas de Kyber y Dilithium y crear enlaces simbólicos
+RUN make kyber_lib && \ 
+    make dilithium_lib && \
     ln -s /usr/src/app/libpqcrystals_kyber512_ref.so /usr/lib/libpqcrystals_kyber512_ref.so && \
     ln -s /usr/src/app/libpqcrystals_dilithium2_ref.so /usr/lib/libpqcrystals_dilithium2_ref.so
 
-# Command to run the compiled binary
-CMD ["./pq-tls-c"]
+# Copiar el script de pruebas.
+COPY ejecutar_pruebas.sh .
+
+# Establecer el permiso de ejecución del script de pruebas
+RUN chmod +x ejecutar_pruebas.sh
+
+# Copiar el archivo fuente del programa principal
+COPY main.c .
+
+# Compilar el programa principal
+RUN make main
+
+# Establecer el punto de entrada
+ENTRYPOINT ["./ejecutar_pruebas.sh"]

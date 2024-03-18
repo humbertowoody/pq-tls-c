@@ -12,7 +12,7 @@ endif
 
 # Define compiler and flags
 CC=gcc
-CFLAGS=-I./kyber/ref -I./dilithium/ref -I$(OPENSSL_PATH)/include #-Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-unused-value -Wno-unused-result -Wno-unused-label -Wno-unused-local-typedefs
+CFLAGS=-I./kyber/ref -I./dilithium/ref -I$(OPENSSL_PATH)/include -Wall -Wextra -Werror -Wno-unused-parameter -Wno-unused-variable -Wno-unused-function -Wno-unused-but-set-variable -Wno-unused-value -Wno-unused-result -Wno-unused-label -Wno-unused-local-typedefs
 LDFLAGS=-L./ -lpqcrystals_kyber512_ref -lpqcrystals_dilithium2_ref -L$(OPENSSL_PATH)/lib -lcrypto -lssl
 EXECUTABLE=pq-tls-c.out
 
