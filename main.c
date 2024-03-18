@@ -8,6 +8,9 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <openssl/evp.h>
+#include <openssl/aes.h>
+#include <openssl/rand.h>
 
 // Constantes de configuración de red.
 #define PUERTO_SERVIDOR 8080
@@ -56,6 +59,64 @@ unsigned char *recibir(int sockfd, size_t *longitud_datos)
   }
 
   return datos;
+}
+
+// Función para shakear una clave.
+void shake_key(const unsigned char *clave, size_t clave_len, unsigned char *salida, int length)
+{
+  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
+  const EVP_MD *md = EVP_sha256();
+  EVP_DigestInit_ex(ctx, md, NULL);
+  EVP_DigestUpdate(ctx, clave, clave_len);
+  EVP_DigestFinal_ex(ctx, salida, NULL);
+  EVP_MD_CTX_free(ctx);
+}
+
+// Función para cifrar con AES.
+int cifrar_aes(const unsigned char *mensaje, size_t mensaje_len, const unsigned char *clave, unsigned char **mensaje_cifrado)
+{
+  int outlen, tmplen, iv_len = AES_BLOCK_SIZE;
+  unsigned char iv[AES_BLOCK_SIZE]; // Inicialización del vector
+  if (!RAND_bytes(iv, sizeof(iv)))
+    return 0; // Genera IV aleatorio
+
+  *mensaje_cifrado = (unsigned char *)malloc(iv_len + mensaje_len + AES_BLOCK_SIZE); // Espacio para IV + padding
+  if (*mensaje_cifrado == NULL)
+    return 0;
+
+  memcpy(*mensaje_cifrado, iv, iv_len); // Prepende el IV al mensaje cifrado
+
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  EVP_EncryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, clave, iv);
+  EVP_EncryptUpdate(ctx, *mensaje_cifrado + iv_len, &outlen, mensaje, mensaje_len);
+  EVP_EncryptFinal_ex(ctx, *mensaje_cifrado + iv_len + outlen, &tmplen);
+  EVP_CIPHER_CTX_free(ctx);
+
+  return iv_len + outlen + tmplen; // Retorna el tamaño del mensaje cifrado
+}
+
+// Función para descifrar con AES.
+int descifrar_aes(const unsigned char *mensaje_cifrado, size_t mensaje_cifrado_len, const unsigned char *clave, unsigned char **mensaje)
+{
+  int outlen, tmplen, iv_len = AES_BLOCK_SIZE;
+  const unsigned char *iv = mensaje_cifrado; // IV está al principio del mensaje cifrado
+
+  *mensaje = (unsigned char *)malloc(mensaje_cifrado_len + AES_BLOCK_SIZE); // Espacio para el mensaje descifrado
+  if (*mensaje == NULL)
+    return 0;
+
+  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+  EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, clave, iv);
+  EVP_DecryptUpdate(ctx, *mensaje, &outlen, mensaje_cifrado + iv_len, mensaje_cifrado_len - iv_len);
+  if (!EVP_DecryptFinal_ex(ctx, *mensaje + outlen, &tmplen))
+  {
+    EVP_CIPHER_CTX_free(ctx);
+    free(*mensaje);
+    return 0; // Error en descifrado, podría ser debido a padding incorrecto
+  }
+  EVP_CIPHER_CTX_free(ctx);
+
+  return outlen + tmplen; // Retorna el tamaño del mensaje descifrado
 }
 
 // Estructura para los argumentos de los hilos clientes, que incluye el ID del cliente y el nivel de verificación.
@@ -396,20 +457,12 @@ int main(int argc, char *argv[])
   printf("[Servidor]: Ciphertext de Kyber enviado al cliente 2 con longitud %lu\n", pqcrystals_kyber512_CIPHERTEXTBYTES);
 
   // Shakear la llave secreta de Kyber para el cliente 1.
-  // unsigned char kyber_shake_secret_cliente_1[pqcrystals_kyber512_BYTES];
-  // if (pqcrystals_kyber512_ref_shake(kyber_shake_secret_cliente_1, pqcrystals_kyber512_BYTES, kyber_shared_secret_cliente_1, pqcrystals_kyber512_BYTES) != 0) {
-  //    printf("[Servidor]: Error shakeando la llave secreta de Kyber para el cliente 1\n");
-  //    return 1;
-  //}
-  // printf("[Servidor]: Llave secreta de Kyber shakeada para el cliente 1\n");
+  shake_key(kyber_shared_secret_cliente_1, pqcrystals_kyber512_BYTES, kyber_shared_secret_cliente_1, pqcrystals_kyber512_BYTES);
+  printf("[Servidor]: Llave secreta de Kyber shakeada para el cliente 1\n");
 
-  //// Shakear la llave secreta de Kyber para el cliente 2.
-  // unsigned char kyber_shake_secret_cliente_2[pqcrystals_kyber512_BYTES];
-  // if (pqcrystals_kyber512_ref_shake(kyber_shake_secret_cliente_2, pqcrystals_kyber512_BYTES, kyber_shared_secret_cliente_2, pqcrystals_kyber512_BYTES) != 0) {
-  //     printf("[Servidor]: Error shakeando la llave secreta de Kyber para el cliente 2\n");
-  //     return 1;
-  // }
-  // printf("[Servidor]: Llave secreta de Kyber shakeada para el cliente 2\n");
+  // Shakear la llave secreta de Kyber para el cliente 2.
+  shake_key(kyber_shared_secret_cliente_2, pqcrystals_kyber512_BYTES, kyber_shared_secret_cliente_2, pqcrystals_kyber512_BYTES);
+  printf("[Servidor]: Llave secreta de Kyber shakeada para el cliente 2\n");
 
   // Según el argumento de nivel de verificación Dilithium, se verifica la llave secreta de Kyber.
   if (nivel_verificacion == 2 || nivel_verificacion == 3)
