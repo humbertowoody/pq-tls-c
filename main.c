@@ -3,17 +3,22 @@
  */
 #include <stdio.h>
 #include <stdlib.h>
-#include <sys/wait.h>
 #include "kyber/ref/api.h"
 #include "dilithium/ref/api.h"
+#include <openssl/evp.h>
+#include <openssl/aes.h>
+#include <openssl/rand.h>
+#include <sys/wait.h>
 #include <pthread.h>
 #include <unistd.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
-#include <openssl/evp.h>
-#include <openssl/aes.h>
-#include <openssl/rand.h>
+#include <netinet/tcp.h>
+#include <time.h>
+
+// Constante para modo de depuración.
+#define DEBUG 1
 
 // Constantes de configuración de red.
 #define PUERTO_SERVIDOR 8080
@@ -21,19 +26,56 @@
 #define CERT_CLIENTE "Certificado del cliente"
 #define CERT_SERVIDOR "Certificado del servidor"
 
+// Constante para el tamaño del búffer de datos.
+#define TAMANO_BUFFER 64
+
+// Variables de sincronización
+pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
+int bandera = 0; // Esta es la "bandera" que los hilos esperarán
+
+// Variables para mediciones de tiempo.
+struct timespec tiempo_kem_inicio, tiempo_kem_fin,
+    tiempo_dss_inicio, tiempo_dss_fin,
+    tiempo_aes_inicio, tiempo_aes_fin,
+    tiempo_total_inicio, tiempo_total_fin;
+struct rusage usage_inicio, usage_fin;
+
+// Función para imprimir únicamente en modo de depuración.
+void debug(const char *format, ...)
+{
+  if (DEBUG)
+  {
+    va_list args;
+    va_start(args, format);
+    vprintf(format, args);
+    va_end(args);
+  }
+}
+
 // Función para enviar datos a un socket.
 void enviar(int sockfd, const unsigned char *datos, size_t longitud_datos)
 {
   // Enviamos la longitud de los datos como un entero de 64 bits
   uint64_t len_net = htonl(longitud_datos); // Convierte de host a orden de red
-  send(sockfd, &len_net, sizeof(len_net), 0);
+  ssize_t cant_enviado = send(sockfd, &len_net, sizeof(len_net), 0);
+  if (cant_enviado != sizeof(len_net))
+  {
+    debug("[ERROR] Error enviando la longitud de los datos al socket\n");
+    return;
+  }
 
   // Enviamos los datos en bloques
   size_t enviado = 0;
   while (enviado < longitud_datos)
   {
-    size_t tam_bloque = (longitud_datos - enviado > 4096) ? 4096 : longitud_datos - enviado;
-    send(sockfd, datos + enviado, tam_bloque, 0);
+    size_t tam_bloque = (longitud_datos - enviado > TAMANO_BUFFER) ? TAMANO_BUFFER : longitud_datos - enviado;
+    cant_enviado = send(sockfd, datos + enviado, tam_bloque, 0);
+    if (cant_enviado <= 0)
+    {
+      debug("[ERROR] Error enviando datos al socket\n");
+      return;
+    }
     enviado += tam_bloque;
   }
 }
@@ -43,7 +85,12 @@ unsigned char *recibir(int sockfd, size_t *longitud_datos)
 {
   // Recibimos la longitud de los datos
   uint64_t len_net;
-  recv(sockfd, &len_net, sizeof(len_net), 0);
+  ssize_t cant_recibido = recv(sockfd, &len_net, sizeof(len_net), 0);
+  if (cant_recibido != sizeof(len_net))
+  {
+    debug("[ERROR] Error recibiendo la longitud de los datos del socket\n");
+    return NULL;
+  }
   *longitud_datos = ntohl(len_net); // Convierte de orden de red a host
 
   // Asignamos memoria para los datos a recibir
@@ -53,14 +100,15 @@ unsigned char *recibir(int sockfd, size_t *longitud_datos)
   size_t recibido = 0;
   while (recibido < *longitud_datos)
   {
-    size_t tam_bloque = (*longitud_datos - recibido > 4096) ? 4096 : *longitud_datos - recibido;
-    ssize_t n = recv(sockfd, datos + recibido, tam_bloque, 0);
-    if (n <= 0)
+    size_t tam_bloque = (*longitud_datos - recibido > TAMANO_BUFFER) ? TAMANO_BUFFER : *longitud_datos - recibido;
+    cant_recibido = recv(sockfd, datos + recibido, tam_bloque, 0);
+    if (cant_recibido <= 0)
     {
+      debug("[ERROR] Error recibiendo datos del socket, se esperaban %lu bytes pero se recibieron %lu bytes\n", *longitud_datos, recibido);
       free(datos); // Liberamos los recursos en caso de error
       return NULL;
     }
-    recibido += n;
+    recibido += cant_recibido;
   }
 
   return datos;
@@ -83,11 +131,17 @@ int cifrar_aes(const unsigned char *mensaje, size_t mensaje_len, const unsigned 
   int outlen, tmplen, iv_len = AES_BLOCK_SIZE;
   unsigned char iv[AES_BLOCK_SIZE]; // Inicialización del vector
   if (!RAND_bytes(iv, sizeof(iv)))
-    return 0; // Genera IV aleatorio
+  {
+    debug("[ERROR] Error generando el IV\n");
+    return 0;
+  }
 
   *mensaje_cifrado = (unsigned char *)malloc(iv_len + mensaje_len + AES_BLOCK_SIZE); // Espacio para IV + padding
   if (*mensaje_cifrado == NULL)
+  {
+    debug("[ERROR] Error asignando memoria para el mensaje cifrado\n");
     return 0;
+  }
 
   memcpy(*mensaje_cifrado, iv, iv_len); // Prepende el IV al mensaje cifrado
 
@@ -108,13 +162,17 @@ int descifrar_aes(const unsigned char *mensaje_cifrado, size_t mensaje_cifrado_l
 
   *mensaje = (unsigned char *)malloc(mensaje_cifrado_len + AES_BLOCK_SIZE); // Espacio para el mensaje descifrado
   if (*mensaje == NULL)
+  {
+    debug("[ERROR] Error asignando memoria para el mensaje descifrado\n");
     return 0;
+  }
 
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
   EVP_DecryptInit_ex(ctx, EVP_aes_256_cbc(), NULL, clave, iv);
   EVP_DecryptUpdate(ctx, *mensaje, &outlen, mensaje_cifrado + iv_len, mensaje_cifrado_len - iv_len);
   if (!EVP_DecryptFinal_ex(ctx, *mensaje + outlen, &tmplen))
   {
+    debug("[ERROR] Error en descifrado\n");
     EVP_CIPHER_CTX_free(ctx);
     free(*mensaje);
     return 0; // Error en descifrado, podría ser debido a padding incorrecto
@@ -142,16 +200,16 @@ void *cliente(void *arg)
   int n_bytes = argumentos->cantidad_bytes;
 
   // Mensaje de inicio.
-  printf("[Cliente %d]: Iniciando cliente...\n", id_cliente);
+  debug("[Cliente %d]: Iniciando cliente...\n", id_cliente);
 
   // Crear el socket del cliente.
   int sockfd = socket(AF_INET, SOCK_STREAM, 0);
   if (sockfd == -1)
   {
-    printf("[Cliente %d]: Error creando el socket\n", id_cliente);
+    debug("[Cliente %d]: Error creando el socket\n", id_cliente);
     return NULL;
   }
-  printf("[Cliente %d]: Socket creado\n", id_cliente);
+  debug("[Cliente %d]: Socket creado\n", id_cliente);
 
   // Configurar el socket del cliente.
   struct sockaddr_in direccion_servidor;
@@ -166,54 +224,71 @@ void *cliente(void *arg)
   so_linger.l_linger = 6;
   if (setsockopt(sockfd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(struct linger)) == -1)
   {
-    printf("[Cliente %d]: Error colocando la opción SO_LINGER en el socket\n", id_cliente);
+    debug("[Cliente %d]: Error colocando la opción SO_LINGER en el socket\n", id_cliente);
     return NULL;
   }
-  printf("[Cliente %d]: Opción SO_LINGER colocada en el socket\n", id_cliente);
+  debug("[Cliente %d]: Opción SO_LINGER colocada en el socket\n", id_cliente);
+
+  // Colocar la opción SO_KEEPALIVE en el socket del cliente.
+  int yes = 1;
+  if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(int)) == -1)
+  {
+    debug("[Cliente %d]: Error colocando la opción SO_KEEPALIVE en el socket\n", id_cliente);
+    return NULL;
+  }
+  debug("[Cliente %d]: Opción SO_KEEPALIVE colocada en el socket\n", id_cliente);
+
+  // Colocar la opción TCP_NODELAY en el socket del cliente.
+  if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int)) == -1)
+  {
+    debug("[Cliente %d]: Error colocando la opción TCP_NODELAY en el socket\n", id_cliente);
+    return NULL;
+  }
+  debug("[Cliente %d]: Opción TCP_NODELAY colocada en el socket\n", id_cliente);
 
   // Conectar el socket del cliente.
   if (connect(sockfd, (struct sockaddr *)&direccion_servidor, sizeof(struct sockaddr_in)) == -1)
   {
-    printf("[Cliente %d]: Error conectando el socket\n", id_cliente);
+    debug("[Cliente %d]: Error conectando el socket\n", id_cliente);
     return NULL;
   }
-  printf("[Cliente %d]: Conexión establecida\n", id_cliente);
+  debug("[Cliente %d]: Conexión establecida\n", id_cliente);
 
   // Inicio del KEM.
-  printf("[Cliente %d]: Iniciando KEM...\n", id_cliente);
+  debug("[Cliente %d]: Iniciando KEM...\n", id_cliente);
 
   // Generar las claves de Kyber.
   unsigned char kyber_pk[pqcrystals_kyber512_PUBLICKEYBYTES];
   unsigned char kyber_sk[pqcrystals_kyber512_SECRETKEYBYTES];
   if (pqcrystals_kyber512_ref_keypair(kyber_pk, kyber_sk) != 0)
   {
-    printf("[Cliente %d]: Error generando las llaves de Kyber\n", id_cliente);
+    debug("[Cliente %d]: Error generando las llaves de Kyber\n", id_cliente);
     return NULL;
   }
-  printf("[Cliente %d]: Llaves de Kyber generadas\n", id_cliente);
+  debug("[Cliente %d]: Llaves de Kyber generadas\n", id_cliente);
 
   // Enviar la llave pública de Kyber al servidor.
   enviar(sockfd, kyber_pk, pqcrystals_kyber512_PUBLICKEYBYTES);
-  printf("[Cliente %d]: Llave pública de Kyber enviada al servidor con longitud %d\n", id_cliente, pqcrystals_kyber512_PUBLICKEYBYTES);
+  debug("[Cliente %d]: Llave pública de Kyber enviada al servidor con longitud %d\n", id_cliente, pqcrystals_kyber512_PUBLICKEYBYTES);
 
   // Recibir el ciphertext de Kyber del servidor.
   size_t longitud_datos;
   unsigned char *kyber_ciphertext = recibir(sockfd, &longitud_datos);
   if (kyber_ciphertext == NULL)
   {
-    printf("[Cliente %d]: Error recibiendo el ciphertext de Kyber del servidor\n", id_cliente);
+    debug("[Cliente %d]: Error recibiendo el ciphertext de Kyber del servidor\n", id_cliente);
     return NULL;
   }
-  printf("[Cliente %d]: Ciphertext de Kyber recibido del servidor con longitud %lu\n", id_cliente, longitud_datos);
+  debug("[Cliente %d]: Ciphertext de Kyber recibido del servidor con longitud %lu\n", id_cliente, longitud_datos);
 
   // Desencapsular la llave secreta de Kyber y generar shared secret.
   unsigned char kyber_shared_secret[pqcrystals_kyber512_BYTES];
   if (pqcrystals_kyber512_ref_dec(kyber_shared_secret, kyber_ciphertext, kyber_sk) != 0)
   {
-    printf("[Cliente %d]: Error desencapsulando la llave secreta de Kyber del servidor\n", id_cliente);
+    debug("[Cliente %d]: Error desencapsulando la llave secreta de Kyber del servidor\n", id_cliente);
     return NULL;
   }
-  printf("[Cliente %d]: Llave secreta de Kyber desencapsulada del servidor con longitud %d\n", id_cliente, pqcrystals_kyber512_BYTES);
+  debug("[Cliente %d]: Llave secreta de Kyber desencapsulada del servidor con longitud %d\n", id_cliente, pqcrystals_kyber512_BYTES);
 
   // Shakear el shared secret de Kyber para obtener la clave AES.
 
@@ -225,28 +300,28 @@ void *cliente(void *arg)
     unsigned char dilithium_sk[pqcrystals_dilithium2_SECRETKEYBYTES];
     if (pqcrystals_dilithium2_ref_keypair(dilithium_pk, dilithium_sk) != 0)
     {
-      printf("[Cliente %d]: Error generando las llaves de Dilithium\n", id_cliente);
+      debug("[Cliente %d]: Error generando las llaves de Dilithium\n", id_cliente);
       return NULL;
     }
-    printf("[Cliente %d]: Llaves de Dilithium generadas\n", id_cliente);
+    debug("[Cliente %d]: Llaves de Dilithium generadas\n", id_cliente);
 
     // Firmar el texto "Certificado del cliente" con la llave privada de Dilithium.
     unsigned char dilithium_cert[pqcrystals_dilithium2_BYTES];
     size_t longitud_cert;
     if (pqcrystals_dilithium2_ref_signature(dilithium_cert, &longitud_cert, (const uint8_t *)CERT_CLIENTE, sizeof(CERT_CLIENTE), dilithium_sk) != 0)
     {
-      printf("[Cliente %d]: Error firmando el texto con la llave privada de Dilithium\n", id_cliente);
+      debug("[Cliente %d]: Error firmando el texto con la llave privada de Dilithium\n", id_cliente);
       return NULL;
     }
-    printf("[Cliente %d]: Texto firmado con la llave privada de Dilithium\n", id_cliente);
+    debug("[Cliente %d]: Texto firmado con la llave privada de Dilithium\n", id_cliente);
 
     // Enviar el certificado de Dilithium al servidor.
     enviar(sockfd, dilithium_cert, pqcrystals_dilithium2_BYTES);
-    printf("[Cliente %d]: Certificado de Dilithium enviado al servidor\n", id_cliente);
+    debug("[Cliente %d]: Certificado de Dilithium enviado al servidor\n", id_cliente);
 
     // Enviar la llave pública de Dilithium al servidor.
     enviar(sockfd, dilithium_pk, pqcrystals_dilithium2_PUBLICKEYBYTES);
-    printf("[Cliente %d]: Llave pública de Dilithium enviada al servidor\n", id_cliente);
+    debug("[Cliente %d]: Llave pública de Dilithium enviada al servidor\n", id_cliente);
   }
 
   if (nivel_verificacion == 3)
@@ -255,93 +330,143 @@ void *cliente(void *arg)
     unsigned char *dilithium_cert_servidor = recibir(sockfd, &longitud_datos);
     if (dilithium_cert_servidor == NULL)
     {
-      printf("[Cliente %d]: Error recibiendo el certificado de Dilithium del servidor\n", id_cliente);
+      debug("[Cliente %d]: Error recibiendo el certificado de Dilithium del servidor\n", id_cliente);
       return NULL;
     }
-    printf("[Cliente %d]: Certificado de Dilithium del servidor recibido con longitud %lu\n", id_cliente, longitud_datos);
+    debug("[Cliente %d]: Certificado de Dilithium del servidor recibido con longitud %lu\n", id_cliente, longitud_datos);
 
     // Recibir la llave pública de Dilithium del servidor.
     size_t longitud_datos2;
     unsigned char *dilithium_pk_servidor = recibir(sockfd, &longitud_datos2);
     if (dilithium_pk_servidor == NULL)
     {
-      printf("[Cliente %d]: Error recibiendo la llave pública de Dilithium del servidor\n", id_cliente);
+      debug("[Cliente %d]: Error recibiendo la llave pública de Dilithium del servidor\n", id_cliente);
       return NULL;
     }
-    printf("[Cliente %d]: Llave pública de Dilithium del servidor recibida con longitud %lu\n", id_cliente, longitud_datos2);
+    debug("[Cliente %d]: Llave pública de Dilithium del servidor recibida con longitud %lu\n", id_cliente, longitud_datos2);
 
     // Verificamos que el certificado de Dilithium del servidor sea válido con su llave pública para el texto "Certificado del servidor"
     if (pqcrystals_dilithium2_ref_verify(dilithium_cert_servidor, longitud_datos, (const uint8_t *)CERT_SERVIDOR, sizeof(CERT_SERVIDOR), dilithium_pk_servidor) != 0)
     {
-      printf("[Cliente %d]: Error verificando el certificado de Dilithium del servidor\n", id_cliente);
+      debug("[Cliente %d]: Error verificando el certificado de Dilithium del servidor\n", id_cliente);
       return NULL;
     }
-    printf("[Cliente %d]: Certificado de Dilithium del servidor verificado\n", id_cliente);
+    debug("[Cliente %d]: Certificado de Dilithium del servidor verificado ✅\n", id_cliente);
+
+    // Liberar la memoria del certificado de Dilithium del servidor.
+    free(dilithium_cert_servidor);
+
+    // Liberar la memoria de la llave pública de Dilithium del servidor.
+    free(dilithium_pk_servidor);
   }
   else
   {
-    printf("[Cliente %d]: No se verificarán los certificados de Dilithium\n", id_cliente);
+    debug("[Cliente %d]: No se verificarán los certificados de Dilithium\n", id_cliente);
   }
 
   // Si es el cliente 1, enviar un mensaje cifrado de longitud n_bytes.
   if (id_cliente == 1)
   {
-    printf("[Cliente %d]: Generando mensaje aleatorio de longitud %d...\n", id_cliente, n_bytes);
+    debug("[Cliente %d]: Generando mensaje aleatorio de longitud %d...\n", id_cliente, n_bytes);
 
     // Generar un mensaje aleatorio de longitud n_bytes.
-    unsigned char mensaje[n_bytes];
-    if (!RAND_bytes(mensaje, n_bytes))
+    unsigned char *mensaje = (unsigned char *)malloc(n_bytes);
+    if (mensaje == NULL)
     {
-      printf("[Cliente %d]: Error generando el mensaje aleatorio\n", id_cliente);
+      debug("[Cliente %d]: Error asignando memoria para el mensaje aleatorio\n", id_cliente);
       return NULL;
     }
-    printf("[Cliente %d]: Mensaje aleatorio generado con longitud %d\n", id_cliente, n_bytes);
+    if (!RAND_bytes(mensaje, n_bytes))
+    {
+      debug("[Cliente %d]: Error generando el mensaje aleatorio\n", id_cliente);
+      return NULL;
+    }
+    debug("[Cliente %d]: Mensaje aleatorio generado con longitud %d\n", id_cliente, n_bytes);
 
     // Cifrar el mensaje usando la llave secreta de Kyber.
     unsigned char *mensaje_cifrado;
     int longitud_mensaje_cifrado = cifrar_aes(mensaje, n_bytes, kyber_shared_secret, &mensaje_cifrado);
     if (longitud_mensaje_cifrado == 0)
     {
-      printf("[Cliente %d]: Error cifrando el mensaje\n", id_cliente);
+      debug("[Cliente %d]: Error cifrando el mensaje\n", id_cliente);
       return NULL;
     }
-    printf("[Cliente %d]: Mensaje cifrado con longitud %d\n", id_cliente, longitud_mensaje_cifrado);
+    debug("[Cliente %d]: Mensaje cifrado con longitud %d\n", id_cliente, longitud_mensaje_cifrado);
 
     // Enviar el mensaje cifrado al servidor.
     enviar(sockfd, mensaje_cifrado, longitud_mensaje_cifrado);
-    printf("[Cliente %d]: Mensaje cifrado enviado al servidor con longitud %d\n", id_cliente, longitud_mensaje_cifrado);
+    debug("[Cliente %d]: Mensaje cifrado enviado al servidor con longitud %d\n", id_cliente, longitud_mensaje_cifrado);
+
+    // Liberar la memoria del mensaje cifrado.
+    free(mensaje_cifrado);
+
+    // Liberar la memoria del mensaje.
+    free(mensaje);
   }
 
   // Si es el cliente 2, recibir un mensaje cifrado y descifrarlo.
   if (id_cliente == 2)
   {
-    printf("[Cliente %d]: Esperando mensaje cifrado del servidor...\n", id_cliente);
+    debug("[Cliente %d]: Esperando mensaje cifrado del servidor...\n", id_cliente);
 
     // Recibir el mensaje cifrado del servidor.
     unsigned char *mensaje_cifrado_servidor = recibir(sockfd, &longitud_datos);
     if (mensaje_cifrado_servidor == NULL)
     {
-      printf("[Cliente %d]: Error recibiendo el mensaje cifrado del servidor\n", id_cliente);
+      debug("[Cliente %d]: Error recibiendo el mensaje cifrado del servidor\n", id_cliente);
       return NULL;
     }
-    printf("[Cliente %d]: Mensaje cifrado del servidor recibido con longitud %lu\n", id_cliente, longitud_datos);
+    debug("[Cliente %d]: Mensaje cifrado del servidor recibido con longitud %lu\n", id_cliente, longitud_datos);
 
     // Descifrar el mensaje usando la llave secreta de Kyber.
     unsigned char *mensaje_descifrado;
     int longitud_mensaje_descifrado = descifrar_aes(mensaje_cifrado_servidor, longitud_datos, kyber_shared_secret, &mensaje_descifrado);
     if (longitud_mensaje_descifrado == 0)
     {
-      printf("[Cliente %d]: Error descifrando el mensaje cifrado\n", id_cliente);
+      debug("[Cliente %d]: Error descifrando el mensaje cifrado\n", id_cliente);
       return NULL;
     }
-    printf("[Cliente %d]: Mensaje descifrado con longitud %d\n", id_cliente, longitud_mensaje_descifrado);
+    debug("[Cliente %d]: Mensaje descifrado con longitud %d\n", id_cliente, longitud_mensaje_descifrado);
+
+    // Liberar la memoria del mensaje descifrado.
+    free(mensaje_descifrado);
+
+    // Liberar la memoria del mensaje cifrado del servidor.
+    free(mensaje_cifrado_servidor);
   }
 
+  debug("[Cliente %d]: Esperando a que el otro cliente termine...\n", id_cliente);
+
+  // Si es el cliente 2, activar la bandera para que el cliente 1 termine.
+  if (id_cliente == 2)
+  {
+    debug("[Cliente %d]: Activando la bandera para que el cliente 1 termine\n", id_cliente);
+    // Informamos a los hilos que terminen.
+    pthread_mutex_lock(&mutex);
+    bandera = 1;                   // Cambia la bandera
+    pthread_cond_broadcast(&cond); // Señala a todos los hilos que esperan en la variable de condición
+    pthread_mutex_unlock(&mutex);
+    debug("[Cliente %d]: Bandera activada\n", id_cliente);
+  }
+
+  // Esperar a la bandera
+  pthread_mutex_lock(&mutex);
+  while (bandera == 0)
+  { // Mientras la bandera no se haya activado, esperar
+    pthread_cond_wait(&cond, &mutex);
+  }
+  pthread_mutex_unlock(&mutex);
+
+  debug("[Cliente %d]: Bandera detectada, terminando...\n", id_cliente);
+
   // Cerrar el socket del cliente.
-  shutdown(sockfd, SHUT_RD);
+  close(sockfd);
+
+  // Limpiar memoria.
+  free(kyber_ciphertext);
 
   // Mensaje de fin.
-  printf("[Cliente %d]: Fin del cliente\n", id_cliente);
+  debug("[Cliente %d]: Fin del cliente\n", id_cliente);
 
   return NULL;
 }
@@ -358,9 +483,9 @@ int main(int argc, char *argv[])
   // Análisis de argumentos.
   if (argc != 3)
   {
-    printf("Uso: %s <nivel_verificacion> <n_bytes>\n", argv[0]);
-    printf("\t- nivel_verificacion: Nivel de verificación (1 - sin verificación, 2 - clientes o 3 - clientes + servidor).\n");
-    printf("\t- n_bytes: Cantidad de bytes a transmitir.\n");
+    debug("Uso: %s <nivel_verificacion> <n_bytes>\n", argv[0]);
+    debug("\t- nivel_verificacion: Nivel de verificación (1 - sin verificación, 2 - clientes o 3 - clientes + servidor).\n");
+    debug("\t- n_bytes: Cantidad de bytes a transmitir.\n");
     return 1;
   }
 
@@ -370,7 +495,7 @@ int main(int argc, char *argv[])
   // Validar el nivel de verificación.
   if (nivel_verificacion < 1 || nivel_verificacion > 3)
   {
-    printf("El nivel de verificación debe ser 1, 2 o 3.\n");
+    debug("El nivel de verificación debe ser 1, 2 o 3.\n");
     return 1;
   }
 
@@ -380,44 +505,55 @@ int main(int argc, char *argv[])
   // Validar la cantidad de bytes.
   if (n_bytes < 1)
   {
-    printf("La cantidad de bytes debe ser mayor a 0.\n");
+    debug("La cantidad de bytes debe ser mayor a 0.\n");
     return 1;
   }
 
   // Imprimimos los argumentos del programa.
-  printf("Argumentos del programa:\n");
+  debug("Argumentos del programa:\n");
   switch (nivel_verificacion)
   {
   case 1:
-    printf("\t- Nivel de verificación: No se verificarán los clientes ni el servidor.\n");
+    debug("\t- Nivel de verificación: No se verificarán los clientes ni el servidor.\n");
     break;
   case 2:
-    printf("\t- Nivel de verificación: Se verificarán los clientes pero no el servidor.\n");
+    debug("\t- Nivel de verificación: Se verificarán los clientes pero no el servidor.\n");
     break;
   case 3:
-    printf("\t- Nivel de verificación: Se verificarán los clientes y el servidor.\n");
+    debug("\t- Nivel de verificación: Se verificarán los clientes y el servidor.\n");
     break;
   }
-  printf("\t- Cantidad de bytes a transmitir: %d\n", n_bytes);
+  debug("\t- Cantidad de bytes a transmitir: %d\n", n_bytes);
+  debug("\t- Tamaño del búffer de datos: %d bytes\n", TAMANO_BUFFER);
+  debug("\t- Puerto del servidor: %d\n", PUERTO_SERVIDOR);
+  debug("\t- Host del servidor: %s\n", HOST_SERVIDOR);
+  debug("\t- Certificado del cliente: %s\n", CERT_CLIENTE);
+  debug("\t- Certificado del servidor: %s\n", CERT_SERVIDOR);
+  debug("\t- Tamaño de la llave pública de Kyber: %d bytes\n", pqcrystals_kyber512_PUBLICKEYBYTES);
+  debug("\t- Tamaño de la llave secreta de Kyber: %d bytes\n", pqcrystals_kyber512_SECRETKEYBYTES);
+  debug("\t- Tamaño del ciphertext de Kyber: %d bytes\n", pqcrystals_kyber512_CIPHERTEXTBYTES);
+  debug("\t- Tamaño de la llave compartida de Kyber: %d bytes\n", pqcrystals_kyber512_BYTES);
+  debug("\t- Tamaño de la llave pública de Dilithium: %d bytes\n", pqcrystals_dilithium2_PUBLICKEYBYTES);
+  debug("\t- Tamaño de la llave secreta de Dilithium: %d bytes\n", pqcrystals_dilithium2_SECRETKEYBYTES);
 
   // Generar las claves de Dilithium para el servidor.
   if (pqcrystals_dilithium2_ref_keypair(dilithium_pk, dilithium_sk) != 0)
   {
-    printf("[Servidor]: Error generando las llaves de Dilithium\n");
+    debug("[Servidor]: Error generando las llaves de Dilithium\n");
     return 1;
   }
 
   // Mensaje de inicio.
-  printf("[Servidor]: Iniciando servidor...\n");
+  debug("[Servidor]: Iniciando servidor...\n");
 
   // Crear el socket del servidor.
   int sockfd = socket(AF_INET, SOCK_STREAM, 0);
   if (sockfd == -1)
   {
-    printf("[Servidor]: Error creando el socket\n");
+    debug("[Servidor]: Error creando el socket\n");
     return 1;
   }
-  printf("[Servidor]: Socket creado\n");
+  debug("[Servidor]: Socket creado\n");
 
   // Configurar el socket del servidor.
   struct sockaddr_in direccion_servidor;
@@ -430,45 +566,63 @@ int main(int argc, char *argv[])
   int yes = 1;
   if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(int)) == -1)
   {
-    printf("[Servidor]: Error colocando la opción REUSEADDR en el socket\n");
+    debug("[Servidor]: Error colocando la opción REUSEADDR en el socket\n");
     return 1;
   }
-  printf("[Servidor]: Opción REUSEADDR colocada en el socket\n");
+  debug("[Servidor]: Opción REUSEADDR colocada en el socket\n");
+
+  // Colocar la opción SO_KEEPALIVE en el socket del servidor.
+  if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(int)) == -1)
+  {
+    debug("[Servidor]: Error colocando la opción SO_KEEPALIVE en el socket\n");
+    return 1;
+  }
+  debug("[Servidor]: Opción SO_KEEPALIVE colocada en el socket\n");
+
+  // Colocar la opción TCP_NODELAY en el socket del servidor.
+  if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int)) == -1)
+  {
+    debug("[Servidor]: Error colocando la opción TCP_NODELAY en el socket\n");
+    return 1;
+  }
+  debug("[Servidor]: Opción TCP_NODELAY colocada en el socket\n");
+
+  // La opción TCP_NODELAY se incluye en la librería:
 
   // Colocar la opción REUSEPORT en el socket del servidor.
   if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(int)) == -1)
   {
-    printf("[Servidor]: Error colocando la opción REUSEPORT en el socket\n");
+    debug("[Servidor]: Error colocando la opción REUSEPORT en el socket\n");
     return 1;
   }
-  printf("[Servidor]: Opción REUSEPORT colocada en el socket\n");
+  debug("[Servidor]: Opción REUSEPORT colocada en el socket\n");
 
   // Colocar la opción SO_LINGER en el socket del servidor.
   struct linger so_linger;
   so_linger.l_onoff = 1;
-  so_linger.l_linger = 6;
+  so_linger.l_linger = 15;
   if (setsockopt(sockfd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(struct linger)) == -1)
   {
-    printf("[Servidor]: Error colocando la opción SO_LINGER en el socket\n");
+    debug("[Servidor]: Error colocando la opción SO_LINGER en el socket\n");
     return 1;
   }
-  printf("[Servidor]: Opción SO_LINGER colocada en el socket\n");
+  debug("[Servidor]: Opción SO_LINGER colocada en el socket\n");
 
   // Enlazar el socket del servidor.
   if (bind(sockfd, (struct sockaddr *)&direccion_servidor, sizeof(direccion_servidor)) == -1)
   {
-    printf("[Servidor]: Error enlazando el socket\n");
+    debug("[Servidor]: Error enlazando el socket\n");
     return 1;
   }
-  printf("[Servidor]: Socket enlazado\n");
+  debug("[Servidor]: Socket enlazado\n");
 
   // Escuchar en el socket del servidor.
   if (listen(sockfd, 5) == -1)
   {
-    printf("[Servidor]: Error escuchando en el socket\n");
+    debug("[Servidor]: Error escuchando en el socket\n");
     return 1;
   }
-  printf("[Servidor]: Escuchando en el socket\n");
+  debug("[Servidor]: Escuchando en el socket\n");
 
   // Lanzamos los hilos de los dos clientes con los argumentos correspondientes.
   pthread_t hilo_cliente_1, hilo_cliente_2;
@@ -476,7 +630,7 @@ int main(int argc, char *argv[])
   argumentos_cliente arg_cliente_2 = {2, nivel_verificacion, n_bytes};
   pthread_create(&hilo_cliente_1, NULL, cliente, &arg_cliente_1);
   pthread_create(&hilo_cliente_2, NULL, cliente, &arg_cliente_2);
-  printf("[Servidor]: Hilos de los clientes lanzados\n");
+  debug("[Servidor]: Hilos de los clientes lanzados\n");
 
   // Aceptar la conexión de un cliente.
   struct sockaddr_in direccion_cliente_1;
@@ -484,10 +638,10 @@ int main(int argc, char *argv[])
   int cliente_1 = accept(sockfd, (struct sockaddr *)&direccion_cliente_1, &tamano_direccion_cliente_1);
   if (cliente_1 == -1)
   {
-    printf("[Servidor]: Error aceptando la conexión del cliente 1\n");
+    debug("[Servidor]: Error aceptando la conexión del cliente 1\n");
     return 1;
   }
-  printf("[Servidor]: Conexión aceptada del cliente 1\n");
+  debug("[Servidor]: Conexión aceptada del cliente 1\n");
 
   // Aceptar la conexión de un cliente.
   struct sockaddr_in direccion_cliente_2;
@@ -495,68 +649,68 @@ int main(int argc, char *argv[])
   int cliente_2 = accept(sockfd, (struct sockaddr *)&direccion_cliente_2, &tamano_direccion_cliente_2);
   if (cliente_2 == -1)
   {
-    printf("[Servidor]: Error aceptando la conexión del cliente 2\n");
+    debug("[Servidor]: Error aceptando la conexión del cliente 2\n");
     return 1;
   }
-  printf("[Servidor]: Conexión aceptada del cliente 2\n");
+  debug("[Servidor]: Conexión aceptada del cliente 2\n");
 
   // Inicio del KEM.
-  printf("[Servidor]: Iniciando KEM...\n");
+  debug("[Servidor]: Iniciando KEM...\n");
 
   // Recibir la llave pública de Kyber del cliente 1.
   size_t longitud_datos;
   unsigned char *kyber_pk_cliente_1 = recibir(cliente_1, &longitud_datos);
   if (kyber_pk_cliente_1 == NULL)
   {
-    printf("[Servidor]: Error recibiendo la llave pública de Kyber del cliente 1\n");
+    debug("[Servidor]: Error recibiendo la llave pública de Kyber del cliente 1\n");
     return 1;
   }
-  printf("[Servidor]: Llave pública de Kyber del cliente 1 recibida con longitud %lu\n", longitud_datos);
+  debug("[Servidor]: Llave pública de Kyber del cliente 1 recibida con longitud %lu\n", longitud_datos);
 
   // Recibir la llave pública de Kyber del cliente 2.
   unsigned char *kyber_pk_cliente_2 = recibir(cliente_2, &longitud_datos);
   if (kyber_pk_cliente_2 == NULL)
   {
-    printf("[Servidor]: Error recibiendo la llave pública de Kyber del cliente 2\n");
+    debug("[Servidor]: Error recibiendo la llave pública de Kyber del cliente 2\n");
     return 1;
   }
-  printf("[Servidor]: Llave pública de Kyber del cliente 2 recibida con longitud %lu\n", longitud_datos);
+  debug("[Servidor]: Llave pública de Kyber del cliente 2 recibida con longitud %lu\n", longitud_datos);
 
   // Encapsular la llave secreta de Kyber para el cliente 1 y generar ciphertext y shared secret.
   unsigned char kyber_ciphertext_cliente_1[pqcrystals_kyber512_CIPHERTEXTBYTES];
   unsigned char kyber_shared_secret_cliente_1[pqcrystals_kyber512_BYTES];
   if (pqcrystals_kyber512_ref_enc(kyber_ciphertext_cliente_1, kyber_shared_secret_cliente_1, kyber_pk_cliente_1) != 0)
   {
-    printf("[Servidor]: Error encapsulando la llave secreta de Kyber para el cliente 1\n");
+    debug("[Servidor]: Error encapsulando la llave secreta de Kyber para el cliente 1\n");
     return 1;
   }
-  printf("[Servidor]: Llave secreta de Kyber encapsulada para el cliente 1\n");
+  debug("[Servidor]: Llave secreta de Kyber encapsulada para el cliente 1\n");
 
   // Encapsular la llave secreta de Kyber para el cliente 2 y generar ciphertext y shared secret.
   unsigned char kyber_ciphertext_cliente_2[pqcrystals_kyber512_CIPHERTEXTBYTES];
   unsigned char kyber_shared_secret_cliente_2[pqcrystals_kyber512_BYTES];
   if (pqcrystals_kyber512_ref_enc(kyber_ciphertext_cliente_2, kyber_shared_secret_cliente_2, kyber_pk_cliente_2) != 0)
   {
-    printf("[Servidor]: Error encapsulando la llave secreta de Kyber para el cliente 2\n");
+    debug("[Servidor]: Error encapsulando la llave secreta de Kyber para el cliente 2\n");
     return 1;
   }
-  printf("[Servidor]: Llave secreta de Kyber encapsulada para el cliente 2\n");
+  debug("[Servidor]: Llave secreta de Kyber encapsulada para el cliente 2\n");
 
   // Enviar el ciphertext de Kyber al cliente 1.
   enviar(cliente_1, kyber_ciphertext_cliente_1, pqcrystals_kyber512_CIPHERTEXTBYTES);
-  printf("[Servidor]: Ciphertext de Kyber enviado al cliente 1 con longitud %d\n", pqcrystals_kyber512_CIPHERTEXTBYTES);
+  debug("[Servidor]: Ciphertext de Kyber enviado al cliente 1 con longitud %d\n", pqcrystals_kyber512_CIPHERTEXTBYTES);
 
   // Enviar el ciphertext de Kyber al cliente 2.
   enviar(cliente_2, kyber_ciphertext_cliente_2, pqcrystals_kyber512_CIPHERTEXTBYTES);
-  printf("[Servidor]: Ciphertext de Kyber enviado al cliente 2 con longitud %d\n", pqcrystals_kyber512_CIPHERTEXTBYTES);
+  debug("[Servidor]: Ciphertext de Kyber enviado al cliente 2 con longitud %d\n", pqcrystals_kyber512_CIPHERTEXTBYTES);
 
   // Shakear la llave secreta de Kyber para el cliente 1.
   shake_key(kyber_shared_secret_cliente_1, pqcrystals_kyber512_BYTES, kyber_shared_secret_cliente_1, pqcrystals_kyber512_BYTES);
-  printf("[Servidor]: Llave secreta de Kyber shakeada para el cliente 1\n");
+  debug("[Servidor]: Llave secreta de Kyber shakeada para el cliente 1\n");
 
   // Shakear la llave secreta de Kyber para el cliente 2.
   shake_key(kyber_shared_secret_cliente_2, pqcrystals_kyber512_BYTES, kyber_shared_secret_cliente_2, pqcrystals_kyber512_BYTES);
-  printf("[Servidor]: Llave secreta de Kyber shakeada para el cliente 2\n");
+  debug("[Servidor]: Llave secreta de Kyber shakeada para el cliente 2\n");
 
   // Según el argumento de nivel de verificación Dilithium, se verifica la llave secreta de Kyber.
   if (nivel_verificacion == 2 || nivel_verificacion == 3)
@@ -565,148 +719,173 @@ int main(int argc, char *argv[])
     unsigned char *dilithium_cert_cliente_1 = recibir(cliente_1, &longitud_datos);
     if (dilithium_cert_cliente_1 == NULL)
     {
-      printf("[Servidor]: Error recibiendo el certificado de Dilithium del cliente 1\n");
+      debug("[Servidor]: Error recibiendo el certificado de Dilithium del cliente 1\n");
       return 1;
     }
-    printf("[Servidor]: Certificado de Dilithium del cliente 1 recibido con longitud %lu\n", longitud_datos);
+    debug("[Servidor]: Certificado de Dilithium del cliente 1 recibido con longitud %lu\n", longitud_datos);
 
     // Recibir la llave pública de Dilithium del cliente 1.
     size_t longitud_datos2;
     unsigned char *dilithium_pk_cliente_1 = recibir(cliente_1, &longitud_datos2);
     if (dilithium_pk_cliente_1 == NULL)
     {
-      printf("[Servidor]: Error recibiendo la llave pública de Dilithium del cliente 1\n");
+      debug("[Servidor]: Error recibiendo la llave pública de Dilithium del cliente 1\n");
       return 1;
     }
-    printf("[Servidor]: Llave pública de Dilithium del cliente 1 recibida con longitud %lu\n", longitud_datos2);
+    debug("[Servidor]: Llave pública de Dilithium del cliente 1 recibida con longitud %lu\n", longitud_datos2);
 
     // Verificamos que el certificado de Dilithium del cliente 1 sea válido con su llave pública para el texto "Certificado del cliente"
     if (pqcrystals_dilithium2_ref_verify(dilithium_cert_cliente_1, longitud_datos, (const uint8_t *)CERT_CLIENTE, sizeof(CERT_CLIENTE), dilithium_pk_cliente_1) != 0)
     {
-      printf("[Servidor]: Error verificando el certificado de Dilithium del cliente 1\n");
+      debug("[Servidor]: Error verificando el certificado de Dilithium del cliente 1\n");
       return 1;
     }
-    printf("[Servidor]: Certificado de Dilithium del cliente 1 verificado\n");
+    debug("[Servidor]: Certificado de Dilithium del cliente 1 verificado ✅\n");
 
     // Recibir el certificado de Dilithium del cliente 2.
     unsigned char *dilithium_cert_cliente_2 = recibir(cliente_2, &longitud_datos);
     if (dilithium_cert_cliente_2 == NULL)
     {
-      printf("[Servidor]: Error recibiendo el certificado de Dilithium del cliente 2\n");
+      debug("[Servidor]: Error recibiendo el certificado de Dilithium del cliente 2\n");
       return 1;
     }
-    printf("[Servidor]: Certificado de Dilithium del cliente 2 recibido con longitud %lu\n", longitud_datos);
+    debug("[Servidor]: Certificado de Dilithium del cliente 2 recibido con longitud %lu\n", longitud_datos);
 
     // Recibir la llave pública de Dilithium del cliente 2.
     unsigned char *dilithium_pk_cliente_2 = recibir(cliente_2, &longitud_datos2);
     if (dilithium_pk_cliente_2 == NULL)
     {
-      printf("[Servidor]: Error recibiendo la llave pública de Dilithium del cliente 2\n");
+      debug("[Servidor]: Error recibiendo la llave pública de Dilithium del cliente 2\n");
       return 1;
     }
-    printf("[Servidor]: Llave pública de Dilithium del cliente 2 recibida con longitud %lu\n", longitud_datos2);
+    debug("[Servidor]: Llave pública de Dilithium del cliente 2 recibida con longitud %lu\n", longitud_datos2);
 
     // Verificamos que el certificado de Dilithium del cliente 2 sea válido con su llave pública para el texto "Certificado del cliente"
     if (pqcrystals_dilithium2_ref_verify(dilithium_cert_cliente_2, longitud_datos, (const uint8_t *)CERT_CLIENTE, sizeof(CERT_CLIENTE), dilithium_pk_cliente_2) != 0)
     {
-      printf("[Servidor]: Error verificando el certificado de Dilithium del cliente 2\n");
+      debug("[Servidor]: Error verificando el certificado de Dilithium del cliente 2\n");
       return 1;
     }
-    printf("[Servidor]: Certificado de Dilithium del cliente 2 verificado\n");
+    debug("[Servidor]: Certificado de Dilithium del cliente 2 verificado ✅\n");
+
+    // Liberar la memoria del certificado de Dilithium del cliente 1.
+    free(dilithium_cert_cliente_1);
+
+    // Liberar la memoria de la llave pública de Dilithium del cliente 1.
+    free(dilithium_pk_cliente_1);
+
+    // Liberar la memoria del certificado de Dilithium del cliente 2.
+    free(dilithium_cert_cliente_2);
+
+    // Liberar la memoria de la llave pública de Dilithium del cliente 2.
+    free(dilithium_pk_cliente_2);
   }
 
   if (nivel_verificacion == 3)
   {
-    printf("[Servidor]: Enviando certificado y llave pública de Dilithium a los clientes\n");
+    debug("[Servidor]: Enviando certificado y llave pública de Dilithium a los clientes\n");
 
     // Firmar el texto "Certificado del servidor" con la llave privada de Dilithium.
     unsigned char dilithium_cert_servidor[pqcrystals_dilithium2_BYTES];
     size_t longitud_cert_servidor;
     if (pqcrystals_dilithium2_ref_signature(dilithium_cert_servidor, &longitud_cert_servidor, (const uint8_t *)CERT_SERVIDOR, sizeof(CERT_SERVIDOR), dilithium_sk) != 0)
     {
-      printf("[Servidor]: Error firmando el texto con la llave privada de Dilithium\n");
+      debug("[Servidor]: Error firmando el texto con la llave privada de Dilithium\n");
       return 1;
     }
-    printf("[Servidor]: Texto firmado con la llave privada de Dilithium\n");
+    debug("[Servidor]: Texto firmado con la llave privada de Dilithium\n");
 
     // Enviar el certificado de Dilithium a los clientes.
     enviar(cliente_1, dilithium_cert_servidor, pqcrystals_dilithium2_BYTES);
     enviar(cliente_2, dilithium_cert_servidor, pqcrystals_dilithium2_BYTES);
-    printf("[Servidor]: Certificado de Dilithium enviado a los clientes con longitud %d\n", pqcrystals_dilithium2_BYTES);
+    debug("[Servidor]: Certificado de Dilithium enviado a los clientes con longitud %d\n", pqcrystals_dilithium2_BYTES);
 
     // Enviar la llave pública de Dilithium a los clientes.
     enviar(cliente_1, dilithium_pk, pqcrystals_dilithium2_PUBLICKEYBYTES);
     enviar(cliente_2, dilithium_pk, pqcrystals_dilithium2_PUBLICKEYBYTES);
-    printf("[Servidor]: Llave pública de Dilithium enviada a los clientes con longitud %d\n", pqcrystals_dilithium2_PUBLICKEYBYTES);
+    debug("[Servidor]: Llave pública de Dilithium enviada a los clientes con longitud %d\n", pqcrystals_dilithium2_PUBLICKEYBYTES);
   }
 
   if (nivel_verificacion == 1)
   {
-    printf("[Servidor]: No se verificarán los certificados de Dilithium\n");
+    debug("[Servidor]: No se verificarán los certificados de Dilithium\n");
   }
 
-  printf("[Servidor]: Esperando mensaje cifrado del cliente 1...\n");
+  debug("[Servidor]: Esperando mensaje cifrado del cliente 1...\n");
 
   // Recibimos el mensaje cifrado del cliente 1 de longitud n_bytes.
   unsigned char *mensaje_cifrado_cliente_1 = recibir(cliente_1, &longitud_datos);
   if (mensaje_cifrado_cliente_1 == NULL)
   {
-    printf("[Servidor]: Error recibiendo el mensaje cifrado del cliente 1\n");
+    debug("[Servidor]: Error recibiendo el mensaje cifrado del cliente 1\n");
     return 1;
   }
-  printf("[Servidor]: Mensaje cifrado del cliente 1 recibido con longitud %lu\n", longitud_datos);
+  debug("[Servidor]: Mensaje cifrado del cliente 1 recibido con longitud %lu\n", longitud_datos);
 
   // Desciframos usando la llave secreta de Kyber del cliente 1.
   unsigned char *mensaje_descifrado_cliente_1;
   int longitud_mensaje_descifrado_cliente_1 = descifrar_aes(mensaje_cifrado_cliente_1, longitud_datos, kyber_shared_secret_cliente_1, &mensaje_descifrado_cliente_1);
   if (longitud_mensaje_descifrado_cliente_1 == 0)
   {
-    printf("[Servidor]: Error descifrando el mensaje cifrado del cliente 1\n");
+    debug("[Servidor]: Error descifrando el mensaje cifrado del cliente 1\n");
     return 1;
   }
-  printf("[Servidor]: Mensaje descifrado del cliente 1 con longitud %d\n", longitud_mensaje_descifrado_cliente_1);
+  debug("[Servidor]: Mensaje descifrado del cliente 1 con longitud %d\n", longitud_mensaje_descifrado_cliente_1);
 
   // Ciframos el mensaje para cliente 2 y enviamos.
   unsigned char *mensaje_cifrado_cliente_2;
   int longitud_mensaje_cifrado_cliente_2 = cifrar_aes(mensaje_descifrado_cliente_1, longitud_mensaje_descifrado_cliente_1, kyber_shared_secret_cliente_2, &mensaje_cifrado_cliente_2);
   if (longitud_mensaje_cifrado_cliente_2 == 0)
   {
-    printf("[Servidor]: Error cifrando el mensaje para el cliente 2\n");
+    debug("[Servidor]: Error cifrando el mensaje para el cliente 2\n");
     return 1;
   }
-  printf("[Servidor]: Mensaje cifrado para el cliente 2 con longitud %d\n", longitud_mensaje_cifrado_cliente_2);
+  debug("[Servidor]: Mensaje cifrado para el cliente 2 con longitud %d\n", longitud_mensaje_cifrado_cliente_2);
 
   // Enviar el mensaje cifrado al cliente 2.
   enviar(cliente_2, mensaje_cifrado_cliente_2, longitud_mensaje_cifrado_cliente_2);
-  printf("[Servidor]: Mensaje cifrado enviado al cliente 2 con longitud %d\n", longitud_mensaje_cifrado_cliente_2);
+  debug("[Servidor]: Mensaje cifrado enviado al cliente 2 con longitud %d\n", longitud_mensaje_cifrado_cliente_2);
 
-  printf("[Servidor]: Fin del servidor\n");
+  debug("[Servidor]: Fin del servidor\n");
 
-  printf("[Servidor]: Esperando a que los hilos de los clientes terminen...\n");
+  debug("[Servidor]: Esperando a que los hilos de los clientes terminen...\n");
 
   // Esperamos a que los hilos terminen.
   pthread_join(hilo_cliente_1, NULL);
   pthread_join(hilo_cliente_2, NULL);
 
-  printf("[Servidor]: Hilos de los clientes terminados\n");
+  debug("[Servidor]: Hilos de los clientes terminados\n");
 
   // Cerrar el socket del cliente 1.
   close(cliente_1);
 
-  printf("[Servidor]: Socket del cliente 1 cerrado\n");
+  debug("[Servidor]: Socket del cliente 1 cerrado\n");
 
   // Cerrar el socket del cliente 2.
   close(cliente_2);
 
-  printf("[Servidor]: Socket del cliente 2 cerrado\n");
+  debug("[Servidor]: Socket del cliente 2 cerrado\n");
 
   // Cerrar el socket del servidor.
   close(sockfd);
 
-  printf("[Servidor]: Socket del servidor cerrado\n");
+  debug("[Servidor]: Socket del servidor cerrado\n");
 
   // Mensaje de fin.
-  printf("Fin del programa\n");
+  debug("Fin del programa\n");
+
+  // Limpiar la memoria.
+  free(kyber_pk_cliente_1);
+  free(kyber_pk_cliente_2);
+  free(mensaje_cifrado_cliente_1);
+  free(mensaje_descifrado_cliente_1);
+  free(mensaje_cifrado_cliente_2);
+
+  // Calcular métricas finales.
+  // double tiempo_total = (double)(clock() - tiempo_inicio) / CLOCKS_PER_SEC;
+
+  // Imprimir métricas finales en formato csv.
+  // printf("%d,%d,%f\n", nivel_verificacion, n_bytes, tiempo_total);
 
   return 0;
 }
