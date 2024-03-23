@@ -16,30 +16,24 @@
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <time.h>
+#include <sys/resource.h>
 
 // Constante para modo de depuración.
-#define DEBUG 1
+#define DEBUG 0
 
 // Constantes de configuración de red.
-#define PUERTO_SERVIDOR 8080
+#define PUERTO_SERVIDOR 8888
 #define HOST_SERVIDOR "127.0.0.1"
 #define CERT_CLIENTE "Certificado del cliente"
 #define CERT_SERVIDOR "Certificado del servidor"
 
 // Constante para el tamaño del búffer de datos.
-#define TAMANO_BUFFER 64
+#define TAMANO_BUFFER 4096
 
 // Variables de sincronización
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 int bandera = 0; // Esta es la "bandera" que los hilos esperarán
-
-// Variables para mediciones de tiempo.
-struct timespec tiempo_kem_inicio, tiempo_kem_fin,
-    tiempo_dss_inicio, tiempo_dss_fin,
-    tiempo_aes_inicio, tiempo_aes_fin,
-    tiempo_total_inicio, tiempo_total_fin;
-struct rusage usage_inicio, usage_fin;
 
 // Función para imprimir únicamente en modo de depuración.
 void debug(const char *format, ...)
@@ -51,6 +45,47 @@ void debug(const char *format, ...)
     vprintf(format, args);
     va_end(args);
   }
+}
+
+// Para la función de obtener memoria, se utilizan funciones específicas para cada sistema operativo.
+#ifdef __APPLE__
+#include <mach/mach.h>
+#endif
+
+#ifdef __linux__
+#include <stdlib.h>
+#include <string.h>
+#endif
+
+long obtener_memoria()
+{
+#ifdef __APPLE__
+  struct task_basic_info info;
+  mach_msg_type_number_t infoCount = TASK_BASIC_INFO_COUNT;
+
+  if (task_info(mach_task_self(), TASK_BASIC_INFO, (task_info_t)&info, &infoCount) != KERN_SUCCESS)
+  {
+    return -1; // Error
+  }
+  return info.resident_size / 1024; // Retorna el uso de memoria en KB
+#endif
+
+#ifdef __linux__
+  FILE *file = fopen("/proc/self/status", "r");
+  char line[128];
+  long result = -1;
+
+  while (fgets(line, 128, file) != NULL)
+  {
+    if (strncmp(line, "VmRSS:", 6) == 0)
+    {
+      sscanf(line + 6, "%ld", &result);
+      break;
+    }
+  }
+  fclose(file);
+  return result; // Retorna el uso de memoria en KB
+#endif
 }
 
 // Función para enviar datos a un socket.
@@ -218,33 +253,33 @@ void *cliente(void *arg)
   direccion_servidor.sin_addr.s_addr = inet_addr(HOST_SERVIDOR);
   memset(direccion_servidor.sin_zero, 0, sizeof(direccion_servidor.sin_zero));
 
-  // Colocar la opción SO_LINGER en el socket del cliente.
-  struct linger so_linger;
-  so_linger.l_onoff = 1;
-  so_linger.l_linger = 6;
-  if (setsockopt(sockfd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(struct linger)) == -1)
-  {
-    debug("[Cliente %d]: Error colocando la opción SO_LINGER en el socket\n", id_cliente);
-    return NULL;
-  }
-  debug("[Cliente %d]: Opción SO_LINGER colocada en el socket\n", id_cliente);
+  // // Colocar la opción SO_LINGER en el socket del cliente.
+  // struct linger so_linger;
+  // so_linger.l_onoff = 1;
+  // so_linger.l_linger = 6;
+  // if (setsockopt(sockfd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(struct linger)) == -1)
+  // {
+  //   debug("[Cliente %d]: Error colocando la opción SO_LINGER en el socket\n", id_cliente);
+  //   return NULL;
+  // }
+  // debug("[Cliente %d]: Opción SO_LINGER colocada en el socket\n", id_cliente);
 
-  // Colocar la opción SO_KEEPALIVE en el socket del cliente.
-  int yes = 1;
-  if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(int)) == -1)
-  {
-    debug("[Cliente %d]: Error colocando la opción SO_KEEPALIVE en el socket\n", id_cliente);
-    return NULL;
-  }
-  debug("[Cliente %d]: Opción SO_KEEPALIVE colocada en el socket\n", id_cliente);
+  // // Colocar la opción SO_KEEPALIVE en el socket del cliente.
+  // int yes = 1;
+  // if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(int)) == -1)
+  // {
+  //   debug("[Cliente %d]: Error colocando la opción SO_KEEPALIVE en el socket\n", id_cliente);
+  //   return NULL;
+  // }
+  // debug("[Cliente %d]: Opción SO_KEEPALIVE colocada en el socket\n", id_cliente);
 
-  // Colocar la opción TCP_NODELAY en el socket del cliente.
-  if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int)) == -1)
-  {
-    debug("[Cliente %d]: Error colocando la opción TCP_NODELAY en el socket\n", id_cliente);
-    return NULL;
-  }
-  debug("[Cliente %d]: Opción TCP_NODELAY colocada en el socket\n", id_cliente);
+  // // Colocar la opción TCP_NODELAY en el socket del cliente.
+  // if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int)) == -1)
+  // {
+  //   debug("[Cliente %d]: Error colocando la opción TCP_NODELAY en el socket\n", id_cliente);
+  //   return NULL;
+  // }
+  // debug("[Cliente %d]: Opción TCP_NODELAY colocada en el socket\n", id_cliente);
 
   // Conectar el socket del cliente.
   if (connect(sockfd, (struct sockaddr *)&direccion_servidor, sizeof(struct sockaddr_in)) == -1)
@@ -479,6 +514,16 @@ int main(int argc, char *argv[])
       n_bytes;                                                      // Cantidad de bytes para las pruebas.
   unsigned char dilithium_pk[pqcrystals_dilithium2_PUBLICKEYBYTES], // Llave pública de Dilithium (Servidor).
       dilithium_sk[pqcrystals_dilithium2_SECRETKEYBYTES];           // Llave privada de Dilithium (Servidor).
+  // Variables para mediciones de tiempo y uso de recursos.
+  struct timespec tiempo_kem_inicio, tiempo_kem_fin,
+      tiempo_dss_inicio, tiempo_dss_fin,
+      tiempo_aes_inicio, tiempo_aes_fin;
+  struct rusage usage_kem_inicio, usage_kem_fin,
+      usage_dss_inicio, usage_dss_fin,
+      usage_aes_inicio, usage_aes_fin;
+  long memoria_kem_inicio, memoria_kem_fin,
+      memoria_dss_inicio, memoria_dss_fin,
+      memoria_aes_inicio, memoria_aes_fin;
 
   // Análisis de argumentos.
   if (argc != 3)
@@ -624,6 +669,12 @@ int main(int argc, char *argv[])
   }
   debug("[Servidor]: Escuchando en el socket\n");
 
+  // Medición de inicio de KEM.
+  clock_gettime(CLOCK_MONOTONIC, &tiempo_kem_inicio);
+  getrusage(RUSAGE_SELF, &usage_kem_inicio);
+  memoria_kem_inicio = obtener_memoria();
+  debug("[Servidor]: Inicio de la medición del KEM\n");
+
   // Lanzamos los hilos de los dos clientes con los argumentos correspondientes.
   pthread_t hilo_cliente_1, hilo_cliente_2;
   argumentos_cliente arg_cliente_1 = {1, nivel_verificacion, n_bytes};
@@ -711,6 +762,18 @@ int main(int argc, char *argv[])
   // Shakear la llave secreta de Kyber para el cliente 2.
   shake_key(kyber_shared_secret_cliente_2, pqcrystals_kyber512_BYTES, kyber_shared_secret_cliente_2, pqcrystals_kyber512_BYTES);
   debug("[Servidor]: Llave secreta de Kyber shakeada para el cliente 2\n");
+
+  // Tomar mediciones de fin de KEM.
+  clock_gettime(CLOCK_MONOTONIC, &tiempo_kem_fin);
+  getrusage(RUSAGE_SELF, &usage_kem_fin);
+  memoria_kem_fin = obtener_memoria();
+  debug("[Servidor]: Fin de la medición del KEM\n");
+
+  // Tomar mediciones de inicio de Dilithium.
+  clock_gettime(CLOCK_MONOTONIC, &tiempo_dss_inicio);
+  getrusage(RUSAGE_SELF, &usage_dss_inicio);
+  memoria_dss_inicio = obtener_memoria();
+  debug("[Servidor]: Inicio de la medición de Dilithium\n");
 
   // Según el argumento de nivel de verificación Dilithium, se verifica la llave secreta de Kyber.
   if (nivel_verificacion == 2 || nivel_verificacion == 3)
@@ -811,6 +874,18 @@ int main(int argc, char *argv[])
     debug("[Servidor]: No se verificarán los certificados de Dilithium\n");
   }
 
+  // Tomar mediciones de fin de Dilithium.
+  clock_gettime(CLOCK_MONOTONIC, &tiempo_dss_fin);
+  getrusage(RUSAGE_SELF, &usage_dss_fin);
+  memoria_dss_fin = obtener_memoria();
+  debug("[Servidor]: Fin de la medición de Dilithium\n");
+
+  // Tomar mediciones de inicio de AES.
+  clock_gettime(CLOCK_MONOTONIC, &tiempo_aes_inicio);
+  getrusage(RUSAGE_SELF, &usage_aes_inicio);
+  memoria_aes_inicio = obtener_memoria();
+  debug("[Servidor]: Inicio de la medición de AES\n");
+
   debug("[Servidor]: Esperando mensaje cifrado del cliente 1...\n");
 
   // Recibimos el mensaje cifrado del cliente 1 de longitud n_bytes.
@@ -856,6 +931,12 @@ int main(int argc, char *argv[])
 
   debug("[Servidor]: Hilos de los clientes terminados\n");
 
+  // Tomar mediciones de fin de AES.
+  clock_gettime(CLOCK_MONOTONIC, &tiempo_aes_fin);
+  getrusage(RUSAGE_SELF, &usage_aes_fin);
+  memoria_aes_fin = obtener_memoria();
+  debug("[Servidor]: Fin de la medición de AES\n");
+
   // Cerrar el socket del cliente 1.
   close(cliente_1);
 
@@ -882,10 +963,35 @@ int main(int argc, char *argv[])
   free(mensaje_cifrado_cliente_2);
 
   // Calcular métricas finales.
-  // double tiempo_total = (double)(clock() - tiempo_inicio) / CLOCKS_PER_SEC;
+  double tiempo_total_kem = (double)(tiempo_kem_fin.tv_sec - tiempo_kem_inicio.tv_sec) + ((double)(tiempo_kem_fin.tv_nsec - tiempo_kem_inicio.tv_nsec) / 1000000000);
+  double tiempo_total_dss = (double)(tiempo_dss_fin.tv_sec - tiempo_dss_inicio.tv_sec) + ((double)(tiempo_dss_fin.tv_nsec - tiempo_dss_inicio.tv_nsec) / 1000000000);
+  double tiempo_total_aes = (double)(tiempo_aes_fin.tv_sec - tiempo_aes_inicio.tv_sec) + ((double)(tiempo_aes_fin.tv_nsec - tiempo_aes_inicio.tv_nsec) / 1000000000);
+  double tiempo_total = tiempo_total_kem + tiempo_total_dss + tiempo_total_aes;
+  double cpu_total_kem = (double)(usage_kem_fin.ru_utime.tv_sec - usage_kem_inicio.ru_utime.tv_sec) + ((double)(usage_kem_fin.ru_utime.tv_usec - usage_kem_inicio.ru_utime.tv_usec) / 1000000) + (double)(usage_kem_fin.ru_stime.tv_sec - usage_kem_inicio.ru_stime.tv_sec) + ((double)(usage_kem_fin.ru_stime.tv_usec - usage_kem_inicio.ru_stime.tv_usec) / 1000000);
+  double cpu_total_dss = (double)(usage_dss_fin.ru_utime.tv_sec - usage_dss_inicio.ru_utime.tv_sec) + ((double)(usage_dss_fin.ru_utime.tv_usec - usage_dss_inicio.ru_utime.tv_usec) / 1000000) + (double)(usage_dss_fin.ru_stime.tv_sec - usage_dss_inicio.ru_stime.tv_sec) + ((double)(usage_dss_fin.ru_stime.tv_usec - usage_dss_inicio.ru_stime.tv_usec) / 1000000);
+  double cpu_total_aes = (double)(usage_aes_fin.ru_utime.tv_sec - usage_aes_inicio.ru_utime.tv_sec) + ((double)(usage_aes_fin.ru_utime.tv_usec - usage_aes_inicio.ru_utime.tv_usec) / 1000000) + (double)(usage_aes_fin.ru_stime.tv_sec - usage_aes_inicio.ru_stime.tv_sec) + ((double)(usage_aes_fin.ru_stime.tv_usec - usage_aes_inicio.ru_stime.tv_usec) / 1000000);
+  double cpu_total = cpu_total_kem + cpu_total_dss + cpu_total_aes;
+  double memoria_promedio_kem = (double)(((memoria_kem_inicio + memoria_kem_fin) / 2) / 1024);
+  double memoria_promedio_dss = (double)(((memoria_dss_inicio + memoria_dss_fin) / 2) / 1024);
+  double memoria_promedio_aes = (double)(((memoria_aes_inicio + memoria_aes_fin) / 2) / 1024);
+
+  debug("Métricas finales:\n");
+  debug("\t- Tiempo total: %f segundos\n", tiempo_total);
+  debug("\t- Tiempo total de KEM: %f segundos\n", tiempo_total_kem);
+  debug("\t- Tiempo total de Dilithium: %f segundos\n", tiempo_total_dss);
+  debug("\t- Tiempo total de AES: %f segundos\n", tiempo_total_aes);
+  debug("\t- CPU total: %f segundos\n", cpu_total);
+  debug("\t- CPU total de KEM: %f segundos\n", cpu_total_kem);
+  debug("\t- CPU total de Dilithium: %f segundos\n", cpu_total_dss);
+  debug("\t- CPU total de AES: %f segundos\n", cpu_total_aes);
+  debug("\t- Memoria promedio de KEM: %f KB\n", memoria_promedio_kem);
+  debug("\t- Memoria promedio de Dilithium: %f KB\n", memoria_promedio_dss);
+  debug("\t- Memoria promedio de AES: %f KB\n", memoria_promedio_aes);
 
   // Imprimir métricas finales en formato csv.
-  // printf("%d,%d,%f\n", nivel_verificacion, n_bytes, tiempo_total);
+  debug("Información en formato CSV:\n");
+  debug("nivel_verificacion,n_bytes,tiempo_total,tiempo_total_kem,tiempo_total_dss,tiempo_total_aes,cpu_total,cpu_total_kem,cpu_total_dss,cpu_total_aes,memoria_promedio_kem,memoria_promedio_dss,memoria_promedio_aes\n");
+  printf("%d,%d,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f\n", nivel_verificacion, n_bytes, tiempo_total, tiempo_total_kem, tiempo_total_dss, tiempo_total_aes, cpu_total, cpu_total_kem, cpu_total_dss, cpu_total_aes, memoria_promedio_kem, memoria_promedio_dss, memoria_promedio_aes);
 
   return 0;
 }
