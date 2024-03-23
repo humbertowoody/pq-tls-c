@@ -253,33 +253,33 @@ void *cliente(void *arg)
   direccion_servidor.sin_addr.s_addr = inet_addr(HOST_SERVIDOR);
   memset(direccion_servidor.sin_zero, 0, sizeof(direccion_servidor.sin_zero));
 
-  // // Colocar la opción SO_LINGER en el socket del cliente.
-  // struct linger so_linger;
-  // so_linger.l_onoff = 1;
-  // so_linger.l_linger = 6;
-  // if (setsockopt(sockfd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(struct linger)) == -1)
-  // {
-  //   debug("[Cliente %d]: Error colocando la opción SO_LINGER en el socket\n", id_cliente);
-  //   return NULL;
-  // }
-  // debug("[Cliente %d]: Opción SO_LINGER colocada en el socket\n", id_cliente);
+  // Colocar la opción SO_LINGER en el socket del cliente.
+  struct linger so_linger;
+  so_linger.l_onoff = 1;
+  so_linger.l_linger = 6;
+  if (setsockopt(sockfd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(struct linger)) == -1)
+  {
+    debug("[Cliente %d]: Error colocando la opción SO_LINGER en el socket\n", id_cliente);
+    return NULL;
+  }
+  debug("[Cliente %d]: Opción SO_LINGER colocada en el socket\n", id_cliente);
 
-  // // Colocar la opción SO_KEEPALIVE en el socket del cliente.
-  // int yes = 1;
-  // if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(int)) == -1)
-  // {
-  //   debug("[Cliente %d]: Error colocando la opción SO_KEEPALIVE en el socket\n", id_cliente);
-  //   return NULL;
-  // }
-  // debug("[Cliente %d]: Opción SO_KEEPALIVE colocada en el socket\n", id_cliente);
+  // Colocar la opción SO_KEEPALIVE en el socket del cliente.
+  int yes = 1;
+  if (setsockopt(sockfd, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(int)) == -1)
+  {
+    debug("[Cliente %d]: Error colocando la opción SO_KEEPALIVE en el socket\n", id_cliente);
+    return NULL;
+  }
+  debug("[Cliente %d]: Opción SO_KEEPALIVE colocada en el socket\n", id_cliente);
 
-  // // Colocar la opción TCP_NODELAY en el socket del cliente.
-  // if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int)) == -1)
-  // {
-  //   debug("[Cliente %d]: Error colocando la opción TCP_NODELAY en el socket\n", id_cliente);
-  //   return NULL;
-  // }
-  // debug("[Cliente %d]: Opción TCP_NODELAY colocada en el socket\n", id_cliente);
+  // Colocar la opción TCP_NODELAY en el socket del cliente.
+  if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int)) == -1)
+  {
+    debug("[Cliente %d]: Error colocando la opción TCP_NODELAY en el socket\n", id_cliente);
+    return NULL;
+  }
+  debug("[Cliente %d]: Opción TCP_NODELAY colocada en el socket\n", id_cliente);
 
   // Conectar el socket del cliente.
   if (connect(sockfd, (struct sockaddr *)&direccion_servidor, sizeof(struct sockaddr_in)) == -1)

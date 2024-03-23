@@ -9,7 +9,7 @@ niveles_dss=(1 2 3)
 cantidades_bytes=(1024 10240 102400 1048576)
 
 # Número de iteraciones por combinación
-NUM_ITERACIONES=2
+NUM_ITERACIONES=150
 
 # Obtener detalles del sistema
 SO=$(uname -s)
@@ -74,7 +74,7 @@ done
 # Mostrar mensaje con el % de iteraciones no exitosas y exitosas
 ITERACIONES_EXITOSAS=$((ITERACIONES_TOTALES - ITERACIONES_NO_EXITOSAS))
 PORCENTAJE_EXITOSAS=$((ITERACIONES_EXITOSAS * 100 / ITERACIONES_TOTALES))
-echo "Pruebas de rendimiento finalizadas, $ITERACIONES_EXITOSAS iteraciones exitosas ($PORCENTAJE_EXITOSAS%)"
+echo "Se obtuvieron $ITERACIONES_EXITOSAS iteraciones exitosas ($PORCENTAJE_EXITOSAS%)"
 
 # Mostrar mensaje de finalización
 echo "Pruebas de rendimiento finalizadas, resultados en $NOMBRE_ARCHIVO"
