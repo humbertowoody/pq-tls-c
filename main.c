@@ -22,18 +22,23 @@
 #define DEBUG 0
 
 // Constantes de configuración de red.
-#define PUERTO_SERVIDOR 8888
+#define PUERTO_SERVIDOR 5565
 #define HOST_SERVIDOR "127.0.0.1"
 #define CERT_CLIENTE "Certificado del cliente"
 #define CERT_SERVIDOR "Certificado del servidor"
 
 // Constante para el tamaño del búffer de datos.
-#define TAMANO_BUFFER 4096
+#define TAMANO_BUFFER 1024
 
-// Variables de sincronización
+// Variables de sincronización para la finalización de los hilos.
 pthread_mutex_t mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t cond = PTHREAD_COND_INITIALIZER;
 int bandera = 0; // Esta es la "bandera" que los hilos esperarán
+
+// Variables de sincronización para el envío del mensaje final.
+pthread_mutex_t mutex_aes = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t cond_aes = PTHREAD_COND_INITIALIZER;
+int bandera_aes = 0; // Esta es la "bandera" que los hilos esperarán
 
 // Función para imprimir únicamente en modo de depuración.
 void debug(const char *format, ...)
@@ -91,14 +96,18 @@ long obtener_memoria()
 // Función para enviar datos a un socket.
 void enviar(int sockfd, const unsigned char *datos, size_t longitud_datos)
 {
+  debug("[INFO %d] Enviando longitud de datos (%lu bytes) al socket\n", sockfd, longitud_datos);
+
   // Enviamos la longitud de los datos como un entero de 64 bits
   uint64_t len_net = htonl(longitud_datos); // Convierte de host a orden de red
   ssize_t cant_enviado = send(sockfd, &len_net, sizeof(len_net), 0);
   if (cant_enviado != sizeof(len_net))
   {
-    debug("[ERROR] Error enviando la longitud de los datos al socket\n");
+    debug("[ERROR %d] Error enviando la longitud de los datos al socket\n", sockfd);
     return;
   }
+
+  debug("[INFO %d] Enviando %lu bytes al socket\n", sockfd, longitud_datos);
 
   // Enviamos los datos en bloques
   size_t enviado = 0;
@@ -108,28 +117,48 @@ void enviar(int sockfd, const unsigned char *datos, size_t longitud_datos)
     cant_enviado = send(sockfd, datos + enviado, tam_bloque, 0);
     if (cant_enviado <= 0)
     {
-      debug("[ERROR] Error enviando datos al socket\n");
+      debug("[ERROR %d] Error enviando datos al socket, se esperaban %lu bytes pero se enviaron %lu bytes\n", sockfd, longitud_datos, enviado);
       return;
     }
     enviado += tam_bloque;
   }
+
+  // Si el total de bytes enviados no coincide con la longitud esperada, retornamos un Error
+  if (enviado != longitud_datos)
+  {
+    debug("[ERROR %d] Error enviando datos al socket, se esperaban %lu bytes pero se enviaron %lu bytes\n", sockfd, longitud_datos, enviado);
+    return;
+  }
+
+  debug("[INFO %d] %lu bytes enviados al socket\n", sockfd, longitud_datos);
 }
 
 // Función para recibir datos de un socket.
 unsigned char *recibir(int sockfd, size_t *longitud_datos)
 {
+  debug("[INFO %d] Recibiendo longitud de datos del socket\n", sockfd);
+
   // Recibimos la longitud de los datos
   uint64_t len_net;
   ssize_t cant_recibido = recv(sockfd, &len_net, sizeof(len_net), 0);
   if (cant_recibido != sizeof(len_net))
   {
-    debug("[ERROR] Error recibiendo la longitud de los datos del socket\n");
+    debug("[ERROR %d] Error recibiendo la longitud de los datos del socket\n", sockfd);
     return NULL;
   }
   *longitud_datos = ntohl(len_net); // Convierte de orden de red a host
 
+  debug("[INFO %d] Recibiendo %lu bytes del socket\n", sockfd, *longitud_datos);
+
   // Asignamos memoria para los datos a recibir
   unsigned char *datos = (unsigned char *)malloc(*longitud_datos);
+
+  // Si no se pudo asignar memoria, retornamos NULL
+  if (datos == NULL)
+  {
+    debug("[ERROR %d] Error asignando memoria para los datos a recibir\n", sockfd);
+    return NULL;
+  }
 
   // Recibimos los datos en bloques
   size_t recibido = 0;
@@ -139,12 +168,22 @@ unsigned char *recibir(int sockfd, size_t *longitud_datos)
     cant_recibido = recv(sockfd, datos + recibido, tam_bloque, 0);
     if (cant_recibido <= 0)
     {
-      debug("[ERROR] Error recibiendo datos del socket, se esperaban %lu bytes pero se recibieron %lu bytes\n", *longitud_datos, recibido);
+      debug("[ERROR %d] Error recibiendo datos del socket, se esperaban %lu bytes pero se recibieron %lu bytes\n", sockfd, *longitud_datos, recibido);
       free(datos); // Liberamos los recursos en caso de error
       return NULL;
     }
     recibido += cant_recibido;
   }
+
+  // Si el total de bytes recibidos no coincide con la longitud esperada, liberamos la memoria y retornamos NULL
+  if (recibido != *longitud_datos)
+  {
+    debug("[ERROR %d] Error recibiendo datos del socket, se esperaban %lu bytes pero se recibieron %lu bytes\n", sockfd, *longitud_datos, recibido);
+    free(datos); // Liberamos los recursos en caso de error
+    return NULL;
+  }
+
+  debug("[INFO %d] %lu bytes recibidos del socket\n", sockfd, *longitud_datos);
 
   return datos;
 }
@@ -244,7 +283,7 @@ void *cliente(void *arg)
     debug("[Cliente %d]: Error creando el socket\n", id_cliente);
     return NULL;
   }
-  debug("[Cliente %d]: Socket creado\n", id_cliente);
+  debug("[Cliente %d]: Socket creado con ID %d\n", id_cliente, sockfd);
 
   // Configurar el socket del cliente.
   struct sockaddr_in direccion_servidor;
@@ -256,7 +295,7 @@ void *cliente(void *arg)
   // Colocar la opción SO_LINGER en el socket del cliente.
   struct linger so_linger;
   so_linger.l_onoff = 1;
-  so_linger.l_linger = 6;
+  so_linger.l_linger = 3;
   if (setsockopt(sockfd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(struct linger)) == -1)
   {
     debug("[Cliente %d]: Error colocando la opción SO_LINGER en el socket\n", id_cliente);
@@ -274,7 +313,7 @@ void *cliente(void *arg)
   debug("[Cliente %d]: Opción SO_KEEPALIVE colocada en el socket\n", id_cliente);
 
   // Colocar la opción TCP_NODELAY en el socket del cliente.
-  if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int)) == -1)
+  if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, (char *)&yes, sizeof(int)) == -1)
   {
     debug("[Cliente %d]: Error colocando la opción TCP_NODELAY en el socket\n", id_cliente);
     return NULL;
@@ -431,6 +470,14 @@ void *cliente(void *arg)
     // Enviar el mensaje cifrado al servidor.
     enviar(sockfd, mensaje_cifrado, longitud_mensaje_cifrado);
     debug("[Cliente %d]: Mensaje cifrado enviado al servidor con longitud %d\n", id_cliente, longitud_mensaje_cifrado);
+
+    // Colocamos la bandera de AES encendida.
+    debug("[Cliente %d]: Activando la bandera para que el servidor lea el mensaje cifrado\n", id_cliente);
+    pthread_mutex_lock(&mutex_aes);
+    bandera_aes = 1;                   // Cambia la bandera
+    pthread_cond_broadcast(&cond_aes); // Señala a todos los hilos que esperan en la variable de condición
+    pthread_mutex_unlock(&mutex_aes);
+    debug("[Cliente %d]: Bandera AES activada\n", id_cliente);
 
     // Liberar la memoria del mensaje cifrado.
     free(mensaje_cifrado);
@@ -598,7 +645,7 @@ int main(int argc, char *argv[])
     debug("[Servidor]: Error creando el socket\n");
     return 1;
   }
-  debug("[Servidor]: Socket creado\n");
+  debug("[Servidor]: Socket creado con ID %d\n", sockfd);
 
   // Configurar el socket del servidor.
   struct sockaddr_in direccion_servidor;
@@ -624,16 +671,6 @@ int main(int argc, char *argv[])
   }
   debug("[Servidor]: Opción SO_KEEPALIVE colocada en el socket\n");
 
-  // Colocar la opción TCP_NODELAY en el socket del servidor.
-  if (setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int)) == -1)
-  {
-    debug("[Servidor]: Error colocando la opción TCP_NODELAY en el socket\n");
-    return 1;
-  }
-  debug("[Servidor]: Opción TCP_NODELAY colocada en el socket\n");
-
-  // La opción TCP_NODELAY se incluye en la librería:
-
   // Colocar la opción REUSEPORT en el socket del servidor.
   if (setsockopt(sockfd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(int)) == -1)
   {
@@ -645,7 +682,7 @@ int main(int argc, char *argv[])
   // Colocar la opción SO_LINGER en el socket del servidor.
   struct linger so_linger;
   so_linger.l_onoff = 1;
-  so_linger.l_linger = 15;
+  so_linger.l_linger = 3;
   if (setsockopt(sockfd, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(struct linger)) == -1)
   {
     debug("[Servidor]: Error colocando la opción SO_LINGER en el socket\n");
@@ -692,7 +729,31 @@ int main(int argc, char *argv[])
     debug("[Servidor]: Error aceptando la conexión del cliente 1\n");
     return 1;
   }
-  debug("[Servidor]: Conexión aceptada del cliente 1\n");
+  debug("[Servidor]: Conexión aceptada del cliente 1 (ID: %d)\n", cliente_1);
+
+  // Colocar opción TCP_NODELAY en el socket del cliente 1.
+  if (setsockopt(cliente_1, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int)) == -1)
+  {
+    debug("[Servidor]: Error colocando la opción TCP_NODELAY en el socket del cliente 1\n");
+    return 1;
+  }
+  debug("[Servidor]: Opción TCP_NODELAY colocada en el socket del cliente 1\n");
+
+  // Colocar opción SO_KEEPALIVE en el socket del cliente 1.
+  if (setsockopt(cliente_1, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(int)) == -1)
+  {
+    debug("[Servidor]: Error colocando la opción SO_KEEPALIVE en el socket del cliente 1\n");
+    return 1;
+  }
+  debug("[Servidor]: Opción SO_KEEPALIVE colocada en el socket del cliente 1\n");
+
+  // Colocar opción SO_LINGER en el socket del cliente 1.
+  if (setsockopt(cliente_1, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(struct linger)) == -1)
+  {
+    debug("[Servidor]: Error colocando la opción SO_LINGER en el socket del cliente 1\n");
+    return 1;
+  }
+  debug("[Servidor]: Opción SO_LINGER colocada en el socket del cliente 1\n");
 
   // Aceptar la conexión de un cliente.
   struct sockaddr_in direccion_cliente_2;
@@ -703,7 +764,31 @@ int main(int argc, char *argv[])
     debug("[Servidor]: Error aceptando la conexión del cliente 2\n");
     return 1;
   }
-  debug("[Servidor]: Conexión aceptada del cliente 2\n");
+  debug("[Servidor]: Conexión aceptada del cliente 2 (ID: %d)\n", cliente_2);
+
+  // Colocar opción TCP_NODELAY en el socket del cliente 2.
+  if (setsockopt(cliente_2, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(int)) == -1)
+  {
+    debug("[Servidor]: Error colocando la opción TCP_NODELAY en el socket del cliente 2\n");
+    return 1;
+  }
+  debug("[Servidor]: Opción TCP_NODELAY colocada en el socket del cliente 2\n");
+
+  // Colocar opción SO_KEEPALIVE en el socket del cliente 2.
+  if (setsockopt(cliente_2, SOL_SOCKET, SO_KEEPALIVE, &yes, sizeof(int)) == -1)
+  {
+    debug("[Servidor]: Error colocando la opción SO_KEEPALIVE en el socket del cliente 2\n");
+    return 1;
+  }
+  debug("[Servidor]: Opción SO_KEEPALIVE colocada en el socket del cliente 2\n");
+
+  // Colocar opción SO_LINGER en el socket del cliente 2.
+  if (setsockopt(cliente_2, SOL_SOCKET, SO_LINGER, &so_linger, sizeof(struct linger)) == -1)
+  {
+    debug("[Servidor]: Error colocando la opción SO_LINGER en el socket del cliente 2\n");
+    return 1;
+  }
+  debug("[Servidor]: Opción SO_LINGER colocada en el socket del cliente 2\n");
 
   // Inicio del KEM.
   debug("[Servidor]: Iniciando KEM...\n");
@@ -886,20 +971,32 @@ int main(int argc, char *argv[])
   memoria_aes_inicio = obtener_memoria();
   debug("[Servidor]: Inicio de la medición de AES\n");
 
+  // Mensaje de espera de la bandera de AES.
+  debug("[Servidor]: Esperando la bandera de AES...\n");
+
+  // Esperar a la bandera de AES.
+  pthread_mutex_lock(&mutex_aes);
+  while (bandera_aes == 0)
+  { // Mientras la bandera no se haya activado, esperar
+    pthread_cond_wait(&cond_aes, &mutex_aes);
+  }
+  pthread_mutex_unlock(&mutex_aes);
+
   debug("[Servidor]: Esperando mensaje cifrado del cliente 1...\n");
 
   // Recibimos el mensaje cifrado del cliente 1 de longitud n_bytes.
-  unsigned char *mensaje_cifrado_cliente_1 = recibir(cliente_1, &longitud_datos);
+  size_t longitud_datos_t;
+  unsigned char *mensaje_cifrado_cliente_1 = recibir(cliente_1, &longitud_datos_t);
   if (mensaje_cifrado_cliente_1 == NULL)
   {
     debug("[Servidor]: Error recibiendo el mensaje cifrado del cliente 1\n");
     return 1;
   }
-  debug("[Servidor]: Mensaje cifrado del cliente 1 recibido con longitud %lu\n", longitud_datos);
+  debug("[Servidor]: Mensaje cifrado del cliente 1 recibido con longitud %lu\n", longitud_datos_t);
 
   // Desciframos usando la llave secreta de Kyber del cliente 1.
   unsigned char *mensaje_descifrado_cliente_1;
-  int longitud_mensaje_descifrado_cliente_1 = descifrar_aes(mensaje_cifrado_cliente_1, longitud_datos, kyber_shared_secret_cliente_1, &mensaje_descifrado_cliente_1);
+  int longitud_mensaje_descifrado_cliente_1 = descifrar_aes(mensaje_cifrado_cliente_1, longitud_datos_t, kyber_shared_secret_cliente_1, &mensaje_descifrado_cliente_1);
   if (longitud_mensaje_descifrado_cliente_1 == 0)
   {
     debug("[Servidor]: Error descifrando el mensaje cifrado del cliente 1\n");
@@ -990,8 +1087,11 @@ int main(int argc, char *argv[])
 
   // Imprimir métricas finales en formato csv.
   debug("Información en formato CSV:\n");
-  debug("nivel_verificacion,n_bytes,tiempo_total,tiempo_total_kem,tiempo_total_dss,tiempo_total_aes,cpu_total,cpu_total_kem,cpu_total_dss,cpu_total_aes,memoria_promedio_kem,memoria_promedio_dss,memoria_promedio_aes\n");
+  debug("nivel_verificacion,n_bytes,tiempo_total_s,tiempo_total_kem_s,tiempo_total_dss_s,tiempo_total_aes_s,cpu_total,cpu_total_kem,cpu_total_dss,cpu_total_aes,memoria_promedio_kem_kb,memoria_promedio_dss_kb,memoria_promedio_aes_kb\n");
   printf("%d,%d,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f,%f\n", nivel_verificacion, n_bytes, tiempo_total, tiempo_total_kem, tiempo_total_dss, tiempo_total_aes, cpu_total, cpu_total_kem, cpu_total_dss, cpu_total_aes, memoria_promedio_kem, memoria_promedio_dss, memoria_promedio_aes);
+
+  // Hacemos el flush de la salida estándar.
+  fflush(stdout);
 
   return 0;
 }

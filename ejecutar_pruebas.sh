@@ -45,7 +45,7 @@ mkdir -p resultados
 NOMBRE_ARCHIVO="resultados/${FECHA_HORA}-${ARQ}-${CPU}cpu-${MEMORIA_MB}MB-${SO}.csv"
 
 # Encabezado del archivo CSV
-echo "nivel_verificacion,n_bytes,tiempo_total,tiempo_total_kem,tiempo_total_dss,tiempo_total_aes,cpu_total,cpu_total_kem,cpu_total_dss,cpu_total_aes,memoria_promedio_kem,memoria_promedio_dss,memoria_promedio_aes" > $NOMBRE_ARCHIVO
+echo "nivel_verificacion,n_bytes,tiempo_total_s,tiempo_total_kem_s,tiempo_total_dss_s,tiempo_total_aes_s,cpu_total,cpu_total_kem,cpu_total_dss,cpu_total_aes,memoria_promedio_kem_kb,memoria_promedio_dss_kb,memoria_promedio_aes_kb" > $NOMBRE_ARCHIVO
 
 # Mostrar mensaje de inicio con el cálculo total de iteraciones así cómo el tiempo estimado de ejecución asumiendo que cada iteración toma 5 segundos
 ITERACIONES_TOTALES=$((${#niveles_dss[@]} * ${#cantidades_bytes[@]} * NUM_ITERACIONES))
